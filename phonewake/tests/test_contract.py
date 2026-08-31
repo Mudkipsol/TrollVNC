@@ -23,6 +23,11 @@ class PhoneWakePackageTests(unittest.TestCase):
 
     def test_tweak_injects_only_into_springboard(self) -> None:
         filter_text = (ROOT / "PhoneWake.plist").read_text(encoding="utf-8")
+        compact_filter = re.sub(r"\s+", "", filter_text)
+        self.assertEqual(
+            compact_filter,
+            '{Filter={Bundles=("com.apple.springboard");};}',
+        )
         self.assertIn('Bundles = ("com.apple.springboard");', filter_text)
         self.assertEqual(filter_text.count("com.apple.springboard"), 1)
         self.assertNotIn("Executables", filter_text)
@@ -117,6 +122,143 @@ class PhoneWakePackageTests(unittest.TestCase):
         )
         self.assertIn("value >> PWGenerationShift", source)
         self.assertIn("value & PWFlagMask", source)
+
+    def test_tweak_uses_local_authentication_as_fail_closed_passcode_gate(self) -> None:
+        source = (ROOT / "Tweak.xm").read_text(encoding="utf-8")
+        self.assertIn("LAPolicyDeviceOwnerAuthentication", source)
+        self.assertIn("LAErrorPasscodeNotSet", source)
+        self.assertIn("PWPasscodeUnknown", source)
+        self.assertIn("context.interactionNotAllowed = YES", source)
+        self.assertRegex(
+            source,
+            r"if \(\[context canEvaluatePolicy:"
+            r"LAPolicyDeviceOwnerAuthentication error:&error\]\)\s*\{\s*"
+            r"return PWPasscodeStatePresent;",
+        )
+        self.assertRegex(
+            source,
+            r"\[error\.domain isEqualToString:LAErrorDomain\]\s*&&\s*"
+            r"error\.code == LAErrorPasscodeNotSet",
+        )
+        self.assertRegex(
+            source,
+            r"error\.code == LAErrorPasscodeNotSet\)\s*\{\s*"
+            r"return PWPasscodeStateAbsent;\s*\}\s*"
+            r"return PWPasscodeStateUnknown;",
+        )
+
+    def test_tweak_declares_fixed_probe_state_and_runtime_imports(self) -> None:
+        source = (ROOT / "Tweak.xm").read_text(encoding="utf-8")
+        imports = re.findall(r'^#import\s+(?:<([^>]+)>|"([^"]+)")$', source, re.MULTILINE)
+        self.assertEqual(
+            [system or local for system, local in imports],
+            [
+                "Foundation/Foundation.h",
+                "LocalAuthentication/LocalAuthentication.h",
+                "UIKit/UIKit.h",
+                "math.h",
+                "notify.h",
+                "objc/message.h",
+                "PhoneWakeProtocol.h",
+            ],
+        )
+        self.assertRegex(
+            source,
+            r"typedef NS_ENUM\(NSInteger, PWPasscodeState\)\s*\{\s*"
+            r"PWPasscodeStateAbsent = 0,\s*"
+            r"PWPasscodeStatePresent = 1,\s*"
+            r"PWPasscodeStateUnknown = 2,\s*\};",
+        )
+        for declaration in (
+            "static int gStateToken = -1;",
+            "static uint32_t gGeneration = 0;",
+            "static BOOL gLastSucceeded = NO;",
+            "static BOOL gLastRefused = NO;",
+        ):
+            self.assertIn(declaration, source)
+
+    def test_tweak_resolves_version_sensitive_selectors_at_runtime(self) -> None:
+        source = (ROOT / "Tweak.xm").read_text(encoding="utf-8")
+        self.assertIn('NSClassFromString(@"SBBacklightController")', source)
+        self.assertIn('NSClassFromString(@"SBLockScreenManager")', source)
+        self.assertIn("respondsToSelector", source)
+        self.assertIn('NSSelectorFromString(@"sharedInstance")', source)
+        self.assertNotRegex(source, r"#import\s+[<\"](?:SpringBoard|SpringBoardHome)")
+        self.assertRegex(source, r"\(\(id \(\*\)\(id, SEL\)\)objc_msgSend\)")
+        self.assertRegex(source, r"\(\(BOOL \(\*\)\(id, SEL\)\)objc_msgSend\)")
+
+    def test_tweak_probes_display_lock_and_full_operation_compatibility(self) -> None:
+        source = (ROOT / "Tweak.xm").read_text(encoding="utf-8")
+        self.assertRegex(
+            source,
+            r"(?s)static BOOL PWReadDisplayOn\(void\).*?"
+            r"NSSelectorFromString\(@\"screenIsOn\"\).*?"
+            r"\? \(\(BOOL \(\*\)\(id, SEL\)\)objc_msgSend\)"
+            r"\(controller, selector\) : NO;",
+        )
+        self.assertRegex(
+            source,
+            r"(?s)static BOOL PWReadLocked\(void\).*?"
+            r"NSSelectorFromString\(@\"isUILocked\"\).*?"
+            r"\? \(\(BOOL \(\*\)\(id, SEL\)\)objc_msgSend\)"
+            r"\(manager, selector\) : YES;",
+        )
+        for selector in (
+            "screenIsOn",
+            "turnOnScreenFullyWithBacklightSource:",
+            "isUILocked",
+            "lockScreenViewControllerRequestsUnlock",
+            "unlockUIFromSource:withOptions:",
+        ):
+            receiver = "backlight" if selector.startswith(("screen", "turn")) else "lock"
+            self.assertIn(
+                f'[{receiver} '
+                f'respondsToSelector:NSSelectorFromString(@"{selector}")]',
+                source,
+            )
+
+    def test_tweak_publishes_generation_tagged_clamped_state(self) -> None:
+        source = (ROOT / "Tweak.xm").read_text(encoding="utf-8")
+        self.assertRegex(
+            source,
+            r"static void PWPublish\(void\)\s*\{\s*"
+            r"if \(gStateToken < 0\) return;",
+        )
+        self.assertIn("uint32_t flags = PWAvailable;", source)
+        for flag in (
+            "PWCompatibleFlag",
+            "PWDisplayOn",
+            "PWLocked",
+            "PWPasscodeSet",
+            "PWPasscodeUnknown",
+            "PWLastRequestSucceeded",
+            "PWLastRequestRefused",
+            "PWCharging",
+            "PWBatteryUnknown",
+        ):
+            self.assertIn(f"flags |= {flag};", source)
+        self.assertIn("flags |= PWEncodeBattery", source)
+        self.assertIn("flags |= PWEncodeThermal", source)
+        self.assertIn("gGeneration += 1;", source)
+        self.assertIn(
+            "notify_set_state(gStateToken, PWEncodeState(gGeneration, flags));",
+            source,
+        )
+        self.assertIn("notify_post(PWStateNotification);", source)
+        self.assertNotRegex(source, r"notify_post\s*\(\s*@?\"")
+
+    def test_tweak_source_has_no_interactive_or_remote_control_surface(self) -> None:
+        source = "\n".join(
+            (ROOT / path).read_text(encoding="utf-8")
+            for path in ("PhoneWakeProtocol.h", "Tweak.xm")
+        )
+        forbidden = re.compile(
+            r"\b(?:attemptUnlockWithPasscode|passcodeEntry|password|PIN|"
+            r"evaluatePolicy|SecItem|Keychain|NSURLSession|CFStream|"
+            r"socket|listener|port|bind|listen|accept|connect|send|recv)\b",
+            re.IGNORECASE,
+        )
+        self.assertIsNone(forbidden.search(source))
 
 
 if __name__ == "__main__":
