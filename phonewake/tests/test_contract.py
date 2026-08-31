@@ -219,11 +219,6 @@ class PhoneWakePackageTests(unittest.TestCase):
 
     def test_tweak_publishes_generation_tagged_clamped_state(self) -> None:
         source = (ROOT / "Tweak.xm").read_text(encoding="utf-8")
-        self.assertRegex(
-            source,
-            r"static void PWPublish\(void\)\s*\{\s*"
-            r"if \(gStateToken < 0\) return;",
-        )
         self.assertIn("uint32_t flags = PWAvailable;", source)
         for flag in (
             "PWCompatibleFlag",
@@ -239,13 +234,62 @@ class PhoneWakePackageTests(unittest.TestCase):
             self.assertIn(f"flags |= {flag};", source)
         self.assertIn("flags |= PWEncodeBattery", source)
         self.assertIn("flags |= PWEncodeThermal", source)
-        self.assertIn("gGeneration += 1;", source)
         self.assertIn(
-            "notify_set_state(gStateToken, PWEncodeState(gGeneration, flags));",
+            "PWEncodeState(candidateGeneration, flags)",
             source,
         )
-        self.assertIn("notify_post(PWStateNotification);", source)
         self.assertNotRegex(source, r"notify_post\s*\(\s*@?\"")
+
+    def test_publish_serializes_all_state_work_on_the_main_queue(self) -> None:
+        source = (ROOT / "Tweak.xm").read_text(encoding="utf-8")
+        publish = source[source.index("static void PWPublish(void)") :]
+        guard = re.match(
+            r"static void PWPublish\(void\)\s*\{\s*"
+            r"if \(!\[NSThread isMainThread\]\)\s*\{\s*"
+            r"dispatch_async\(dispatch_get_main_queue\(\),\s*\^\{\s*"
+            r"PWPublish\(\);\s*\}\);\s*return;\s*\}\s*",
+            publish,
+        )
+        self.assertIsNotNone(guard)
+        guarded_publish = publish[guard.end() :]
+        self.assertRegex(guarded_publish, r"^if \(gStateToken < 0\) return;")
+        for state_work in (
+            "gStateToken",
+            "PWReadPasscodeState()",
+            "PWIsCompatible()",
+            "PWReadDisplayOn()",
+            "PWReadLocked()",
+            "gLastSucceeded",
+            "gLastRefused",
+            "[UIDevice currentDevice]",
+            "gGeneration",
+            "notify_set_state",
+            "notify_post",
+        ):
+            self.assertIn(state_work, guarded_publish)
+
+    def test_publish_commits_generation_only_after_notify_state_succeeds(self) -> None:
+        source = (ROOT / "Tweak.xm").read_text(encoding="utf-8")
+        publish = source[source.index("static void PWPublish(void)") :]
+        self.assertNotIn("gGeneration += 1;", publish)
+        self.assertRegex(
+            publish,
+            r"(?s)uint32_t candidateGeneration = gGeneration \+ 1u;\s*"
+            r"if \(notify_set_state\(gStateToken,\s*"
+            r"PWEncodeState\(candidateGeneration, flags\)\)\s*"
+            r"!= NOTIFY_STATUS_OK\)\s*\{\s*"
+            r"NSLog\(@\"PhoneWake publication failed\"\);\s*"
+            r"return;\s*\}\s*"
+            r"gGeneration = candidateGeneration;\s*"
+            r"if \(notify_post\(PWStateNotification\) != NOTIFY_STATUS_OK\)\s*\{\s*"
+            r"NSLog\(@\"PhoneWake notification failed\"\);\s*\}",
+        )
+        logs = re.findall(r'NSLog\(@"([^"]*)"\);', publish)
+        self.assertEqual(
+            logs,
+            ["PhoneWake publication failed", "PhoneWake notification failed"],
+        )
+        self.assertTrue(all("%" not in message for message in logs))
 
     def test_tweak_source_has_no_interactive_or_remote_control_surface(self) -> None:
         source = "\n".join(

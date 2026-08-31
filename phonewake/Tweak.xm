@@ -63,6 +63,12 @@ static BOOL PWIsCompatible(void) {
 }
 
 static void PWPublish(void) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            PWPublish();
+        });
+        return;
+    }
     if (gStateToken < 0) return;
     PWPasscodeState passcode = PWReadPasscodeState();
     uint32_t flags = PWAvailable;
@@ -83,7 +89,14 @@ static void PWPublish(void) {
         flags |= PWEncodeBattery((uint32_t)lround(device.batteryLevel * 100.0f));
     }
     flags |= PWEncodeThermal((uint32_t)[NSProcessInfo processInfo].thermalState);
-    gGeneration += 1;
-    notify_set_state(gStateToken, PWEncodeState(gGeneration, flags));
-    notify_post(PWStateNotification);
+    uint32_t candidateGeneration = gGeneration + 1u;
+    if (notify_set_state(gStateToken, PWEncodeState(candidateGeneration, flags))
+            != NOTIFY_STATUS_OK) {
+        NSLog(@"PhoneWake publication failed");
+        return;
+    }
+    gGeneration = candidateGeneration;
+    if (notify_post(PWStateNotification) != NOTIFY_STATUS_OK) {
+        NSLog(@"PhoneWake notification failed");
+    }
 }
