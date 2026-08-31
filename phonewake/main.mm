@@ -100,13 +100,11 @@ static BOOL PWFlagsAreValid(uint32_t flags) {
     BOOL passcodeUnknown = (flags & PWPasscodeUnknown) != 0;
     BOOL batteryUnknown = (flags & PWBatteryUnknown) != 0;
     uint32_t batteryPercent = (flags & PWBatteryMask) >> PWBatteryShift;
-    uint32_t thermalState = (flags & PWThermalMask) >> PWThermalShift;
 
     if (outcomeCount > 1u) return NO;
     if (passcodeSet && passcodeUnknown) return NO;
     if (!batteryUnknown && batteryPercent > 100u) return NO;
     if (batteryUnknown && batteryPercent != 0u) return NO;
-    if (thermalState > 3u) return NO;
     return YES;
 }
 
@@ -218,13 +216,11 @@ int main(int argc, char *argv[]) {
                     : @(((flags & PWBatteryMask) >> PWBatteryShift) / 100.0),
                 @"charging": @((flags & PWCharging) != 0),
                 @"thermal_state": [@[@"nominal", @"fair", @"serious", @"critical"]
-                    objectAtIndex:thermalIndex],
-                @"reason": (flags & PWRequestRejected)
-                    ? @"request rejected"
-                    : ((flags & PWLastRequestRefused)
-                        ? @"passcode present or unknown"
-                        : ((flags & PWLastRequestSucceeded)
-                            ? @"ok" : @"request failed")),
+                    objectAtIndex:MIN(thermalIndex, 3u)],
+                @"reason": (flags & PWLastRequestRefused)
+                    ? @"passcode present or unknown"
+                    : ((flags & PWLastRequestSucceeded)
+                        ? @"ok" : @"request failed"),
             };
 
             NSError *jsonError = nil;

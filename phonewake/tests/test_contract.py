@@ -69,7 +69,10 @@ def decode_cli_response(
     passcode_unknown = bool(flags & PW_PASSCODE_UNKNOWN)
     battery_unknown = bool(flags & PW_BATTERY_UNKNOWN)
     battery_percent = (flags & PW_BATTERY_MASK) >> PW_BATTERY_SHIFT
-    thermal_index = (flags & PW_THERMAL_MASK) >> PW_THERMAL_SHIFT
+    thermal_index = min(
+        (flags & PW_THERMAL_MASK) >> PW_THERMAL_SHIFT,
+        3,
+    )
 
     if expected_ticket == 0 or ticket != expected_ticket:
         raise TimeoutError("response ticket did not match")
@@ -85,9 +88,6 @@ def decode_cli_response(
         raise ValueError("battery percent is invalid")
     if battery_unknown and battery_percent != 0:
         raise ValueError("unknown battery has a payload")
-    if thermal_index > 3:
-        raise ValueError("thermal state is invalid")
-
     return {
         "available": bool(flags & PW_AVAILABLE),
         "compatible": bool(flags & PW_COMPATIBLE),
@@ -100,9 +100,7 @@ def decode_cli_response(
             thermal_index
         ],
         "reason": (
-            "request rejected"
-            if rejected
-            else "passcode present or unknown"
+            "passcode present or unknown"
             if refused
             else "ok"
             if succeeded
@@ -397,7 +395,6 @@ class PhoneWakePackageTests(unittest.TestCase):
         self.assertIn("passcodeSet && passcodeUnknown", validation)
         self.assertIn("!batteryUnknown && batteryPercent > 100u", validation)
         self.assertIn("batteryUnknown && batteryPercent != 0u", validation)
-        self.assertIn("thermalState > 3u", validation)
 
         result_block = source[
             source.index("NSDictionary *result = @{") : source.index(
@@ -420,13 +417,34 @@ class PhoneWakePackageTests(unittest.TestCase):
         )
         self.assertIn("PWBatteryUnknown", result_block)
         self.assertIn("PWPasscodeUnknown", result_block)
+
+    def test_cli_clamps_encoded_thermal_values_to_critical(self) -> None:
+        source = (ROOT / "main.mm").read_text(encoding="utf-8")
+        validation = source[
+            source.index("static BOOL PWFlagsAreValid") : source.index("int main(")
+        ]
+        self.assertNotIn("thermalState > 3u", validation)
+        result_block = source[
+            source.index("NSDictionary *result = @{") : source.index(
+                "NSJSONSerialization", source.index("NSDictionary *result = @{")
+            )
+        ]
+        self.assertIn("objectAtIndex:MIN(thermalIndex, 3u)", result_block)
+
+    def test_cli_preserves_public_reason_contract(self) -> None:
+        source = (ROOT / "main.mm").read_text(encoding="utf-8")
+        result_block = source[
+            source.index("NSDictionary *result = @{") : source.index(
+                "NSJSONSerialization", source.index("NSDictionary *result = @{")
+            )
+        ]
         for reason in (
-            "request rejected",
             "passcode present or unknown",
             "ok",
             "request failed",
         ):
             self.assertIn(f'@"{reason}"', result_block)
+        self.assertNotIn('@"request rejected"', result_block)
 
     def test_cli_checks_complete_one_line_json_output_before_success(self) -> None:
         source = (ROOT / "main.mm").read_text(encoding="utf-8")
@@ -516,7 +534,17 @@ class PhoneWakePackageTests(unittest.TestCase):
             10 << PW_GENERATION_SHIFT,
             9,
         )
-        self.assertEqual(rejected["reason"], "request rejected")
+        self.assertEqual(rejected["reason"], "request failed")
+
+        for encoded_thermal in (4, 7):
+            clamped = decode_cli_response(
+                encode_response(45, encoded_thermal << PW_THERMAL_SHIFT),
+                45,
+                12 << PW_GENERATION_SHIFT,
+                11,
+            )
+            self.assertEqual(clamped["thermal_state"], "critical")
+            self.assertEqual(clamped["reason"], "request failed")
 
         failed = decode_cli_response(
             encode_response(44, 0),
@@ -541,7 +569,6 @@ class PhoneWakePackageTests(unittest.TestCase):
             "unknown battery payload": (
                 PW_BATTERY_UNKNOWN | (1 << PW_BATTERY_SHIFT)
             ),
-            "thermal above critical": 4 << PW_THERMAL_SHIFT,
         }
         for name, flags in invalid_flags.items():
             with self.subTest(name=name), self.assertRaises(ValueError):
