@@ -7,6 +7,61 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
+PW_AVAILABLE = 1 << 0
+PW_COMPATIBLE = 1 << 1
+PW_DISPLAY_ON = 1 << 2
+PW_LOCKED = 1 << 3
+PW_PASSCODE_SET = 1 << 4
+PW_PASSCODE_UNKNOWN = 1 << 5
+PW_LAST_REQUEST_SUCCEEDED = 1 << 6
+PW_LAST_REQUEST_REFUSED = 1 << 7
+PW_CHARGING = 1 << 8
+PW_BATTERY_SHIFT = 9
+PW_BATTERY_MASK = 0x7F << PW_BATTERY_SHIFT
+PW_THERMAL_SHIFT = 16
+PW_THERMAL_MASK = 0x7 << PW_THERMAL_SHIFT
+PW_BATTERY_UNKNOWN = 1 << 19
+PW_GENERATION_SHIFT = 32
+
+
+def decode_cli_state(value: int, starting_generation: int) -> dict[str, object]:
+    generation = value >> PW_GENERATION_SHIFT
+    flags = value & 0xFFFFFFFF
+    succeeded = bool(flags & PW_LAST_REQUEST_SUCCEEDED)
+    refused = bool(flags & PW_LAST_REQUEST_REFUSED)
+    passcode_set = bool(flags & PW_PASSCODE_SET)
+    passcode_unknown = bool(flags & PW_PASSCODE_UNKNOWN)
+    battery_unknown = bool(flags & PW_BATTERY_UNKNOWN)
+    battery_percent = (flags & PW_BATTERY_MASK) >> PW_BATTERY_SHIFT
+
+    if generation == starting_generation:
+        raise ValueError("generation did not change")
+    if succeeded and refused:
+        raise ValueError("outcome flags conflict")
+    if passcode_set and passcode_unknown:
+        raise ValueError("passcode flags conflict")
+    if not battery_unknown and battery_percent > 100:
+        raise ValueError("battery percent is invalid")
+
+    thermal_index = min((flags & PW_THERMAL_MASK) >> PW_THERMAL_SHIFT, 3)
+    return {
+        "available": bool(flags & PW_AVAILABLE),
+        "compatible": bool(flags & PW_COMPATIBLE),
+        "display_on": bool(flags & PW_DISPLAY_ON),
+        "locked": bool(flags & PW_LOCKED),
+        "passcode_set": None if passcode_unknown else passcode_set,
+        "battery_level": None if battery_unknown else battery_percent / 100.0,
+        "charging": bool(flags & PW_CHARGING),
+        "thermal_state": ("nominal", "fair", "serious", "critical")[
+            thermal_index
+        ],
+        "reason": (
+            "passcode present or unknown"
+            if refused
+            else "ok" if succeeded else "request failed"
+        ),
+    }
+
 
 class RequestLifecycleModel:
     def __init__(self, capacity: int) -> None:
@@ -92,6 +147,225 @@ class PhoneWakePackageTests(unittest.TestCase):
             for path in (ROOT / "Makefile", ROOT / "control", ROOT / "PhoneWake.plist")
         )
         self.assertIsNone(re.search(r"\b(listener|socket|port)\b", skeleton, re.I))
+
+    def test_cli_accepts_only_status_wake_unlock(self) -> None:
+        source = (ROOT / "main.mm").read_text(encoding="utf-8")
+        self.assertRegex(
+            source,
+            r"if \(argc != 2 \|\| argv\[1\] == NULL\) return PWFail\(64\);",
+        )
+        self.assertIn('isEqualToString:@"status"', source)
+        self.assertIn('isEqualToString:@"wake"', source)
+        self.assertIn('isEqualToString:@"unlock"', source)
+        self.assertEqual(
+            re.findall(
+                r'if \(\[command isEqualToString:@"(\w+)"\]\)\s*'
+                r"return (PWRequest\w+);",
+                source,
+            ),
+            [
+                ("status", "PWRequestStatus"),
+                ("wake", "PWRequestWake"),
+                ("unlock", "PWRequestUnlock"),
+            ],
+        )
+        self.assertRegex(
+            source,
+            r"initWithBytes:argv\[1\]\s*length:strlen\(argv\[1\]\)\s*"
+            r"encoding:NSUTF8StringEncoding",
+        )
+        main = source[source.index("int main(") :]
+        self.assertLess(main.index("argc != 2"), main.index("notify_register_check"))
+        self.assertLess(main.index("requestName == NULL"), main.index("notify_post"))
+
+    def test_cli_posts_once_and_waits_for_a_fresh_generation(self) -> None:
+        source = (ROOT / "main.mm").read_text(encoding="utf-8")
+        self.assertEqual(source.count("notify_post("), 1)
+        self.assertIn("PWDecodeGeneration(startingState)", source)
+        self.assertIn("PWDecodeGeneration(latestState)", source)
+        self.assertRegex(
+            source,
+            r"for \(NSUInteger poll = 0; poll < 40; poll \+= 1\)\s*\{\s*"
+            r"usleep\(50000\);",
+        )
+        self.assertEqual(source.count("usleep(50000)"), 1)
+        polling = source[
+            source.index("for (NSUInteger poll") : source.index(
+                "if (stateReadFailed)"
+            )
+        ]
+        self.assertNotRegex(polling, r"while\s*\(")
+        self.assertIn("PWStateIsValid(latestState, startingGeneration)", source)
+
+    def test_cli_checks_notify_calls_and_cancels_every_registered_token(self) -> None:
+        source = (ROOT / "main.mm").read_text(encoding="utf-8")
+        self.assertRegex(
+            source,
+            r"notify_register_check\(PWStateNotification, &token\)\s*"
+            r"!= NOTIFY_STATUS_OK",
+        )
+        self.assertEqual(source.count("notify_get_state("), 2)
+        self.assertRegex(
+            source,
+            r"notify_get_state\(token, &startingState\)\s*!= NOTIFY_STATUS_OK",
+        )
+        self.assertRegex(
+            source,
+            r"notify_get_state\(token, &latestState\)\s*!= NOTIFY_STATUS_OK",
+        )
+        self.assertRegex(
+            source,
+            r"notify_post\(requestName\)\s*!= NOTIFY_STATUS_OK",
+        )
+        self.assertRegex(
+            source,
+            r"if \(token >= 0\)\s*\{\s*"
+            r"int cancelStatus = notify_cancel\(token\);\s*"
+            r"token = -1;\s*"
+            r"if \(cancelStatus != NOTIFY_STATUS_OK\) exitCode = 70;\s*\}",
+        )
+        main = source[source.index("int main(") :]
+        registration = main.index("notify_register_check")
+        cleanup = main.index("notify_cancel")
+        self.assertNotIn("return", main[registration:cleanup])
+
+    def test_cli_validates_state_before_emitting_exact_json(self) -> None:
+        source = (ROOT / "main.mm").read_text(encoding="utf-8")
+        validation = source[
+            source.index("static BOOL PWStateIsValid") : source.index("int main(")
+        ]
+        self.assertIn("generation == startingGeneration", validation)
+        self.assertIn("succeeded && refused", validation)
+        self.assertIn("passcodeSet && passcodeUnknown", validation)
+        self.assertIn("!batteryUnknown && batteryPercent > 100u", validation)
+
+        result_block = source[
+            source.index("NSDictionary *result = @{") : source.index(
+                "NSJSONSerialization", source.index("NSDictionary *result = @{")
+            )
+        ]
+        self.assertEqual(
+            set(re.findall(r'^\s+@"([a-z_]+)"\s*:', result_block, re.MULTILINE)),
+            {
+                "available",
+                "compatible",
+                "display_on",
+                "locked",
+                "passcode_set",
+                "battery_level",
+                "charging",
+                "thermal_state",
+                "reason",
+            },
+        )
+        self.assertIn("PWBatteryUnknown", result_block)
+        self.assertIn("PWPasscodeUnknown", result_block)
+        self.assertIn("MIN(thermalIndex, 3u)", result_block)
+        for reason in (
+            "passcode present or unknown",
+            "ok",
+            "request failed",
+        ):
+            self.assertIn(f'@"{reason}"', result_block)
+
+    def test_cli_serializes_once_and_has_bounded_generic_exit_behavior(self) -> None:
+        source = (ROOT / "main.mm").read_text(encoding="utf-8")
+        self.assertEqual(source.count("NSJSONSerialization dataWithJSONObject"), 1)
+        self.assertRegex(
+            source,
+            r"dataWithJSONObject:result\s+options:0\s+error:&jsonError",
+        )
+        self.assertIn("if (json == nil || jsonError != nil) break;", source)
+        self.assertIn('fputs("phonewakectl: request failed\\n", stderr);', source)
+        self.assertEqual(source.count("stderr"), 1)
+        self.assertNotIn("fprintf", source)
+        self.assertNotIn("NSLog", source)
+        self.assertRegex(source, r"exitCode = 70;")
+        self.assertRegex(source, r"exitCode = 69;")
+        self.assertRegex(source, r"exitCode = 0;")
+        self.assertIn("return PWFail(64);", source)
+        self.assertIn("return PWFail(exitCode);", source)
+        self.assertIn("return 0;", source)
+        self.assertEqual(source.count("fwrite("), 2)
+        self.assertNotIn("NSJSONWritingPrettyPrinted", source)
+        main = source[source.index("int main(") :]
+        self.assertLess(main.index("notify_cancel"), main.index("exitCode != 0"))
+        self.assertLess(main.index("exitCode != 0"), main.index("fwrite("))
+
+    def test_cli_model_decodes_valid_flags_and_exact_reasons(self) -> None:
+        flags = (
+            PW_AVAILABLE
+            | PW_COMPATIBLE
+            | PW_DISPLAY_ON
+            | PW_PASSCODE_SET
+            | PW_LAST_REQUEST_SUCCEEDED
+            | PW_CHARGING
+            | (73 << PW_BATTERY_SHIFT)
+            | (2 << PW_THERMAL_SHIFT)
+        )
+        decoded = decode_cli_state((8 << PW_GENERATION_SHIFT) | flags, 7)
+        self.assertEqual(
+            decoded,
+            {
+                "available": True,
+                "compatible": True,
+                "display_on": True,
+                "locked": False,
+                "passcode_set": True,
+                "battery_level": 0.73,
+                "charging": True,
+                "thermal_state": "serious",
+                "reason": "ok",
+            },
+        )
+
+        refused = decode_cli_state(
+            (9 << PW_GENERATION_SHIFT)
+            | PW_PASSCODE_UNKNOWN
+            | PW_BATTERY_UNKNOWN
+            | PW_LAST_REQUEST_REFUSED
+            | (7 << PW_THERMAL_SHIFT),
+            8,
+        )
+        self.assertIsNone(refused["passcode_set"])
+        self.assertIsNone(refused["battery_level"])
+        self.assertEqual(refused["thermal_state"], "critical")
+        self.assertEqual(refused["reason"], "passcode present or unknown")
+
+        failed = decode_cli_state(10 << PW_GENERATION_SHIFT, 9)
+        self.assertEqual(failed["reason"], "request failed")
+
+    def test_cli_model_rejects_invalid_fresh_state(self) -> None:
+        invalid_values = {
+            "stale generation": 4 << PW_GENERATION_SHIFT,
+            "conflicting outcome": (
+                (5 << PW_GENERATION_SHIFT)
+                | PW_LAST_REQUEST_SUCCEEDED
+                | PW_LAST_REQUEST_REFUSED
+            ),
+            "conflicting passcode": (
+                (5 << PW_GENERATION_SHIFT) | PW_PASSCODE_SET | PW_PASSCODE_UNKNOWN
+            ),
+            "battery above one hundred": (
+                (5 << PW_GENERATION_SHIFT) | (101 << PW_BATTERY_SHIFT)
+            ),
+        }
+        for name, value in invalid_values.items():
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                decode_cli_state(value, 4)
+
+    def test_cli_source_has_no_remote_or_arbitrary_execution_surface(self) -> None:
+        source = (ROOT / "main.mm").read_text(encoding="utf-8")
+        forbidden = re.compile(
+            r"\b(?:NSURLSession|CFStream|socket|listener|port|bind|listen|"
+            r"accept|connect|send|recv|password|credential|passcodeEntry|"
+            r"system|popen|NSTask|posix_spawn|fopen|open)\b",
+            re.IGNORECASE,
+        )
+        self.assertIsNone(forbidden.search(source))
+        self.assertNotIn("stringWithFormat", source)
+        self.assertNotIn("notificationWithName", source)
+        self.assertNotIn("CFNotificationCenterGetDistributedCenter", source)
 
     def test_protocol_exposes_only_three_fixed_requests(self) -> None:
         source = (ROOT / "PhoneWakeProtocol.h").read_text(encoding="utf-8")
