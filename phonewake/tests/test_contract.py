@@ -291,6 +291,175 @@ class PhoneWakePackageTests(unittest.TestCase):
         )
         self.assertTrue(all("%" not in message for message in logs))
 
+    def test_wake_only_turns_on_a_supported_display_that_is_off(self) -> None:
+        source = (ROOT / "Tweak.xm").read_text(encoding="utf-8")
+        wake = re.search(
+            r"(?s)static BOOL PWWakeDisplay\(void\)\s*\{(.*?)\n\}", source
+        )
+        self.assertIsNotNone(wake)
+        body = wake.group(1)
+        self.assertIn('NSSelectorFromString(@"screenIsOn")', body)
+        self.assertIn(
+            'NSSelectorFromString(@"turnOnScreenFullyWithBacklightSource:")', body
+        )
+        self.assertRegex(
+            body,
+            r"if \(!controller \|\| !\[controller respondsToSelector:displayOn\]\s*"
+            r"\|\| !\[controller respondsToSelector:turnOn\]\) return NO;",
+        )
+        self.assertRegex(
+            body,
+            r"if \(!PWReadDisplayOn\(\)\)\s*\{\s*"
+            r"\(\(void \(\*\)\(id, SEL, long long\)\)objc_msgSend\)"
+            r"\(controller, turnOn, 2\);\s*\}\s*return YES;",
+        )
+        self.assertEqual(
+            source.count(
+                "((void (*)(id, SEL, long long))objc_msgSend)(controller, turnOn, 2);"
+            ),
+            1,
+        )
+
+    def test_unlock_refuses_every_passcode_state_except_absent(self) -> None:
+        source = (ROOT / "Tweak.xm").read_text(encoding="utf-8")
+        unlock = re.search(
+            r"(?s)static BOOL PWUnlockWithoutPasscode\(BOOL \*refused\)\s*"
+            r"\{(.*?)\n\}",
+            source,
+        )
+        self.assertIsNotNone(unlock)
+        body = unlock.group(1)
+        self.assertRegex(
+            body,
+            r"PWPasscodeState passcode = PWReadPasscodeState\(\);\s*"
+            r"if \(passcode != PWPasscodeStateAbsent\)\s*\{\s*"
+            r"if \(refused\) \*refused = YES;\s*return NO;\s*\}",
+        )
+        self.assertIn("if (!PWWakeDisplay()) return NO;", body)
+        self.assertIn("gLastRefused = YES", source)
+        self.assertNotIn("evaluatePolicy:", source)
+
+    def test_request_handler_serializes_exclusive_outcomes_and_publish(self) -> None:
+        source = (ROOT / "Tweak.xm").read_text(encoding="utf-8")
+        handler = re.search(
+            r"(?s)static void PWHandle\(NSString \*request\)\s*\{(.*?)\n\}", source
+        )
+        self.assertIsNotNone(handler)
+        body = handler.group(1)
+        self.assertRegex(
+            body,
+            r"^\s*dispatch_async\(dispatch_get_main_queue\(\),\s*\^\{\s*"
+            r"gLastSucceeded = NO;\s*gLastRefused = NO;",
+        )
+        self.assertRegex(
+            body,
+            r"else if \(\[request isEqualToString:"
+            r"\[NSString stringWithUTF8String:PWRequestUnlock\]\]\)\s*\{\s*"
+            r"BOOL refused = NO;\s*"
+            r"gLastSucceeded = PWUnlockWithoutPasscode\(&refused\);\s*"
+            r"if \(refused\)\s*\{\s*"
+            r"gLastSucceeded = NO;\s*gLastRefused = YES;\s*\}",
+        )
+        self.assertRegex(
+            body,
+            r"dispatch_after\(dispatch_time\(DISPATCH_TIME_NOW,\s*"
+            r"250 \* NSEC_PER_MSEC\),\s*dispatch_get_main_queue\(\),\s*"
+            r"\^\{ PWPublish\(\); \}\);",
+        )
+        self.assertEqual(body.count("PWPublish();"), 1)
+        self.assertNotRegex(body, r"gLastSucceeded\s*=\s*YES;\s*gLastRefused\s*=\s*YES;")
+
+    def test_requests_use_exact_fixed_darwin_callbacks_and_names(self) -> None:
+        source = (ROOT / "Tweak.xm").read_text(encoding="utf-8")
+        self.assertEqual(source.count("CFNotificationCenterAddObserver"), 3)
+        self.assertEqual(
+            re.findall(
+                r"CFNotificationCenterAddObserver\(center, &gObserverMarker,\s*"
+                r"(PW\w+Callback),\s*(g\w+Request), NULL,\s*"
+                r"CFNotificationSuspensionBehaviorDeliverImmediately\);",
+                source,
+            ),
+            [
+                ("PWStatusCallback", "gStatusRequest"),
+                ("PWWakeCallback", "gWakeRequest"),
+                ("PWUnlockCallback", "gUnlockRequest"),
+            ],
+        )
+        self.assertEqual(
+            re.findall(
+                r"static void (PW\w+Callback)\([^)]*\)\s*\{\s*"
+                r"PWHandle\(\[NSString stringWithUTF8String:(PWRequest\w+)\]\);\s*\}",
+                source,
+            ),
+            [
+                ("PWStatusCallback", "PWRequestStatus"),
+                ("PWWakeCallback", "PWRequestWake"),
+                ("PWUnlockCallback", "PWRequestUnlock"),
+            ],
+        )
+        self.assertEqual(
+            re.findall(
+                r"(g\w+Request) = CFStringCreateWithCString\(\s*"
+                r"NULL, (PWRequest\w+), kCFStringEncodingUTF8\);",
+                source,
+            ),
+            [
+                ("gStatusRequest", "PWRequestStatus"),
+                ("gWakeRequest", "PWRequestWake"),
+                ("gUnlockRequest", "PWRequestUnlock"),
+            ],
+        )
+
+    def test_constructor_validates_complete_setup_before_registration(self) -> None:
+        source = (ROOT / "Tweak.xm").read_text(encoding="utf-8")
+        self.assertIn("%ctor", source)
+        self.assertIn("%dtor", source)
+        ctor = source[source.index("%ctor") : source.index("%dtor")]
+        bundle_check = ctor.index(
+            '[[NSBundle mainBundle].bundleIdentifier isEqualToString:'
+            '@"com.apple.springboard"]'
+        )
+        token_registration = ctor.index("notify_register_check")
+        observer_registration = ctor.index("CFNotificationCenterAddObserver")
+        initial_publish = ctor.rindex("PWPublish();")
+        self.assertLess(bundle_check, token_registration)
+        self.assertLess(token_registration, observer_registration)
+        self.assertLess(observer_registration, initial_publish)
+        self.assertRegex(
+            ctor,
+            r"if \(!center \|\| !gStatusRequest \|\| !gWakeRequest\s*"
+            r"\|\| !gUnlockRequest\)\s*\{\s*PWCleanup\(\);\s*return;\s*\}",
+        )
+        self.assertEqual(ctor.count("PWPublish();"), 1)
+
+    def test_destructor_removes_observers_releases_names_and_resets_state(self) -> None:
+        source = (ROOT / "Tweak.xm").read_text(encoding="utf-8")
+        cleanup = re.search(
+            r"(?s)static void PWCleanup\(void\)\s*\{(.*?)\n\}", source
+        )
+        self.assertIsNotNone(cleanup)
+        body = cleanup.group(1)
+        self.assertEqual(body.count("CFNotificationCenterRemoveEveryObserver"), 1)
+        for request in ("gStatusRequest", "gWakeRequest", "gUnlockRequest"):
+            self.assertRegex(
+                body,
+                rf"if \({request} != NULL\)\s*\{{\s*CFRelease\({request}\);\s*"
+                rf"{request} = NULL;\s*\}}",
+            )
+        self.assertRegex(
+            body,
+            r"if \(gStateToken >= 0\)\s*\{\s*notify_cancel\(gStateToken\);\s*"
+            r"gStateToken = -1;\s*\}",
+        )
+        for reset in (
+            "gGeneration = 0;",
+            "gLastSucceeded = NO;",
+            "gLastRefused = NO;",
+        ):
+            self.assertIn(reset, body)
+        dtor = source[source.index("%dtor") :]
+        self.assertRegex(dtor, r"%dtor\s*\{\s*@autoreleasepool\s*\{\s*PWCleanup\(\);\s*\}\s*\}")
+
     def test_tweak_source_has_no_interactive_or_remote_control_surface(self) -> None:
         source = "\n".join(
             (ROOT / path).read_text(encoding="utf-8")
@@ -299,7 +468,8 @@ class PhoneWakePackageTests(unittest.TestCase):
         forbidden = re.compile(
             r"\b(?:attemptUnlockWithPasscode|passcodeEntry|password|PIN|"
             r"evaluatePolicy|SecItem|Keychain|NSURLSession|CFStream|"
-            r"socket|listener|port|bind|listen|accept|connect|send|recv)\b",
+            r"socket|listener|port|bind|listen|accept|connect|send|recv|"
+            r"stringWithFormat|CFNotificationCenterGetDistributedCenter)\b",
             re.IGNORECASE,
         )
         self.assertIsNone(forbidden.search(source))

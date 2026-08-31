@@ -17,6 +17,10 @@ static int gStateToken = -1;
 static uint32_t gGeneration = 0;
 static BOOL gLastSucceeded = NO;
 static BOOL gLastRefused = NO;
+static CFStringRef gStatusRequest = NULL;
+static CFStringRef gWakeRequest = NULL;
+static CFStringRef gUnlockRequest = NULL;
+static uint8_t gObserverMarker = 0;
 
 static id PWSharedInstance(Class cls) {
     SEL selector = NSSelectorFromString(@"sharedInstance");
@@ -98,5 +102,143 @@ static void PWPublish(void) {
     gGeneration = candidateGeneration;
     if (notify_post(PWStateNotification) != NOTIFY_STATUS_OK) {
         NSLog(@"PhoneWake notification failed");
+    }
+}
+
+static BOOL PWWakeDisplay(void) {
+    id controller = PWSharedInstance(NSClassFromString(@"SBBacklightController"));
+    SEL displayOn = NSSelectorFromString(@"screenIsOn");
+    SEL turnOn = NSSelectorFromString(@"turnOnScreenFullyWithBacklightSource:");
+    if (!controller || ![controller respondsToSelector:displayOn]
+            || ![controller respondsToSelector:turnOn]) return NO;
+    if (!PWReadDisplayOn()) {
+        ((void (*)(id, SEL, long long))objc_msgSend)(controller, turnOn, 2);
+    }
+    return YES;
+}
+
+static BOOL PWUnlockWithoutPasscode(BOOL *refused) {
+    PWPasscodeState passcode = PWReadPasscodeState();
+    if (passcode != PWPasscodeStateAbsent) {
+        if (refused) *refused = YES;
+        return NO;
+    }
+    if (!PWWakeDisplay()) return NO;
+    id manager = PWSharedInstance(NSClassFromString(@"SBLockScreenManager"));
+    if (!manager) return NO;
+    SEL request = NSSelectorFromString(@"lockScreenViewControllerRequestsUnlock");
+    SEL fallback = NSSelectorFromString(@"unlockUIFromSource:withOptions:");
+    if ([manager respondsToSelector:request]) {
+        ((void (*)(id, SEL))objc_msgSend)(manager, request);
+        return YES;
+    }
+    if ([manager respondsToSelector:fallback]) {
+        ((void (*)(id, SEL, int, id))objc_msgSend)(manager, fallback, 0, nil);
+        return YES;
+    }
+    return NO;
+}
+
+static void PWHandle(NSString *request) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        gLastSucceeded = NO;
+        gLastRefused = NO;
+        if ([request isEqualToString:[NSString stringWithUTF8String:PWRequestStatus]]) {
+            gLastSucceeded = YES;
+        } else if ([request isEqualToString:[NSString stringWithUTF8String:PWRequestWake]]) {
+            gLastSucceeded = PWWakeDisplay();
+        } else if ([request isEqualToString:[NSString stringWithUTF8String:PWRequestUnlock]]) {
+            BOOL refused = NO;
+            gLastSucceeded = PWUnlockWithoutPasscode(&refused);
+            if (refused) {
+                gLastSucceeded = NO;
+                gLastRefused = YES;
+            }
+        }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{ PWPublish(); });
+    });
+}
+
+static void PWStatusCallback(CFNotificationCenterRef, void *, CFStringRef,
+                             const void *, CFDictionaryRef) {
+    PWHandle([NSString stringWithUTF8String:PWRequestStatus]);
+}
+
+static void PWWakeCallback(CFNotificationCenterRef, void *, CFStringRef,
+                           const void *, CFDictionaryRef) {
+    PWHandle([NSString stringWithUTF8String:PWRequestWake]);
+}
+
+static void PWUnlockCallback(CFNotificationCenterRef, void *, CFStringRef,
+                             const void *, CFDictionaryRef) {
+    PWHandle([NSString stringWithUTF8String:PWRequestUnlock]);
+}
+
+static void PWCleanup(void) {
+    CFNotificationCenterRef center = CFNotificationCenterGetDarwinNotifyCenter();
+    if (center) {
+        CFNotificationCenterRemoveEveryObserver(center, &gObserverMarker);
+    }
+    if (gStatusRequest != NULL) {
+        CFRelease(gStatusRequest);
+        gStatusRequest = NULL;
+    }
+    if (gWakeRequest != NULL) {
+        CFRelease(gWakeRequest);
+        gWakeRequest = NULL;
+    }
+    if (gUnlockRequest != NULL) {
+        CFRelease(gUnlockRequest);
+        gUnlockRequest = NULL;
+    }
+    if (gStateToken >= 0) {
+        notify_cancel(gStateToken);
+        gStateToken = -1;
+    }
+    gGeneration = 0;
+    gLastSucceeded = NO;
+    gLastRefused = NO;
+}
+
+%ctor {
+    @autoreleasepool {
+        if (![[NSBundle mainBundle].bundleIdentifier isEqualToString:@"com.apple.springboard"]) return;
+        if (notify_register_check(PWStateNotification, &gStateToken)
+                != NOTIFY_STATUS_OK) {
+            PWCleanup();
+            return;
+        }
+        CFNotificationCenterRef center = CFNotificationCenterGetDarwinNotifyCenter();
+        if (!center) {
+            PWCleanup();
+            return;
+        }
+        gStatusRequest = CFStringCreateWithCString(
+            NULL, PWRequestStatus, kCFStringEncodingUTF8);
+        gWakeRequest = CFStringCreateWithCString(
+            NULL, PWRequestWake, kCFStringEncodingUTF8);
+        gUnlockRequest = CFStringCreateWithCString(
+            NULL, PWRequestUnlock, kCFStringEncodingUTF8);
+        if (!center || !gStatusRequest || !gWakeRequest || !gUnlockRequest) {
+            PWCleanup();
+            return;
+        }
+        CFNotificationCenterAddObserver(center, &gObserverMarker, PWStatusCallback,
+            gStatusRequest, NULL,
+            CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(center, &gObserverMarker, PWWakeCallback,
+            gWakeRequest, NULL,
+            CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(center, &gObserverMarker, PWUnlockCallback,
+            gUnlockRequest, NULL,
+            CFNotificationSuspensionBehaviorDeliverImmediately);
+        PWPublish();
+    }
+}
+
+%dtor {
+    @autoreleasepool {
+        PWCleanup();
     }
 }
