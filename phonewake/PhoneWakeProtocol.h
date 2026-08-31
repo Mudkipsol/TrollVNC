@@ -5,6 +5,9 @@
 static const char *PWRequestStatus = "com.mudkipsol.phonewake.request.status";
 static const char *PWRequestWake = "com.mudkipsol.phonewake.request.wake";
 static const char *PWRequestUnlock = "com.mudkipsol.phonewake.request.unlock";
+static const char *PWResponseStatus = "com.mudkipsol.phonewake.response.status";
+static const char *PWResponseWake = "com.mudkipsol.phonewake.response.wake";
+static const char *PWResponseUnlock = "com.mudkipsol.phonewake.response.unlock";
 static const char *PWStateNotification = "com.mudkipsol.phonewake.state";
 
 enum PWStateFlag : uint32_t {
@@ -18,14 +21,21 @@ enum PWStateFlag : uint32_t {
     PWLastRequestRefused = 1u << 7,
     PWCharging = 1u << 8,
     PWBatteryUnknown = 1u << 19,
+    PWRequestRejected = 1u << 20,
 };
 
 static const uint32_t PWBatteryShift = 9;
 static const uint32_t PWBatteryMask = 0x7fu << PWBatteryShift;
 static const uint32_t PWThermalShift = 16;
 static const uint32_t PWThermalMask = 0x7u << PWThermalShift;
+static const uint32_t PWKnownFlagMask = PWAvailable | PWCompatibleFlag
+    | PWDisplayOn | PWLocked | PWPasscodeSet | PWPasscodeUnknown
+    | PWLastRequestSucceeded | PWLastRequestRefused | PWCharging
+    | PWBatteryMask | PWThermalMask | PWBatteryUnknown | PWRequestRejected;
 static const uint64_t PWFlagMask = 0xffffffffULL;
 static const uint64_t PWGenerationShift = 32;
+static const uint64_t PWResponseFlagMask = 0xffffffffULL;
+static const uint64_t PWResponseTicketShift = 32;
 
 static inline uint64_t PWEncodeState(uint32_t generation, uint32_t flags) {
     return ((uint64_t)generation << PWGenerationShift) | flags;
@@ -37,6 +47,18 @@ static inline uint32_t PWDecodeGeneration(uint64_t value) {
 
 static inline uint32_t PWDecodeFlags(uint64_t value) {
     return (uint32_t)(value & PWFlagMask);
+}
+
+static inline uint64_t PWEncodeResponse(uint32_t ticket, uint32_t flags) {
+    return ((uint64_t)ticket << PWResponseTicketShift) | flags;
+}
+
+static inline uint32_t PWDecodeResponseTicket(uint64_t value) {
+    return (uint32_t)(value >> PWResponseTicketShift);
+}
+
+static inline uint32_t PWDecodeResponseFlags(uint64_t value) {
+    return (uint32_t)(value & PWResponseFlagMask);
 }
 
 static inline uint32_t PWEncodeBattery(uint32_t percent) {
