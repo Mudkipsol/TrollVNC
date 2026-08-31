@@ -8,6 +8,46 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
+class RequestLifecycleModel:
+    def __init__(self, capacity: int) -> None:
+        self.capacity = capacity
+        self.active: tuple[str, bool, bool] | None = None
+        self.pending: list[tuple[str, bool, bool]] = []
+        self.publications: list[tuple[bool, bool]] = []
+
+    def accept(
+        self,
+        request: str,
+        *,
+        action_started: bool = True,
+        refused: bool = False,
+    ) -> bool:
+        if len(self.pending) + (self.active is not None) >= self.capacity:
+            return False
+        item = (request, action_started, refused)
+        if self.active is None:
+            self.active = item
+        else:
+            self.pending.append(item)
+        return True
+
+    def settle(self, *, display_on: bool = False, locked: bool = True) -> None:
+        if self.active is None:
+            return
+        request, action_started, refused = self.active
+        succeeded = (
+            not refused
+            and action_started
+            and (
+                request == "status"
+                or (request == "wake" and display_on)
+                or (request == "unlock" and display_on and not locked)
+            )
+        )
+        self.publications.append((succeeded, refused and not succeeded))
+        self.active = self.pending.pop(0) if self.pending else None
+
+
 class PhoneWakePackageTests(unittest.TestCase):
     def test_package_is_rootless_and_depends_on_ellekit(self) -> None:
         control = (ROOT / "control").read_text(encoding="utf-8")
@@ -336,10 +376,10 @@ class PhoneWakePackageTests(unittest.TestCase):
             r"if \(refused\) \*refused = YES;\s*return NO;\s*\}",
         )
         self.assertIn("if (!PWWakeDisplay()) return NO;", body)
-        self.assertIn("gLastRefused = YES", source)
+        self.assertIn("gLastRefused = refused && !succeeded;", source)
         self.assertNotIn("evaluatePolicy:", source)
 
-    def test_request_handler_serializes_exclusive_outcomes_and_publish(self) -> None:
+    def test_request_handler_uses_bounded_main_queue_fifo(self) -> None:
         source = (ROOT / "Tweak.xm").read_text(encoding="utf-8")
         handler = re.search(
             r"(?s)static void PWHandle\(NSString \*request\)\s*\{(.*?)\n\}", source
@@ -348,26 +388,114 @@ class PhoneWakePackageTests(unittest.TestCase):
         body = handler.group(1)
         self.assertRegex(
             body,
-            r"^\s*dispatch_async\(dispatch_get_main_queue\(\),\s*\^\{\s*"
-            r"gLastSucceeded = NO;\s*gLastRefused = NO;",
+            r"^\s*if \(!\[NSThread isMainThread\]\)\s*\{\s*"
+            r"dispatch_sync\(dispatch_get_main_queue\(\),\s*\^\{\s*"
+            r"PWHandle\(request\);\s*\}\);\s*return;\s*\}",
+        )
+        self.assertIn("PWRequestKindForName(request)", body)
+        self.assertIn("if (!PWEnqueueRequest(kind)) return;", body)
+        self.assertIn("PWStartNextRequest();", body)
+        self.assertNotIn("gLastSucceeded", body)
+        self.assertNotIn("gLastRefused", body)
+
+        self.assertIn("static const uint8_t PWMaxOutstandingRequests = 8;", source)
+        self.assertIn(
+            "static PWRequestKind gPendingRequests[PWMaxOutstandingRequests];",
+            source,
         )
         self.assertRegex(
-            body,
-            r"else if \(\[request isEqualToString:"
-            r"\[NSString stringWithUTF8String:PWRequestUnlock\]\]\)\s*\{\s*"
-            r"BOOL refused = NO;\s*"
-            r"gLastSucceeded = PWUnlockWithoutPasscode\(&refused\);\s*"
-            r"if \(refused\)\s*\{\s*"
-            r"gLastSucceeded = NO;\s*gLastRefused = YES;\s*\}",
+            source,
+            r"uint8_t outstanding = gPendingCount\s*"
+            r"\+ \(gRequestActive \? 1u : 0u\);\s*"
+            r"if \(outstanding >= PWMaxOutstandingRequests\) return NO;",
         )
+        self.assertIn(
+            "(gPendingHead + gPendingCount) % PWMaxOutstandingRequests", source
+        )
+
+    def test_settle_observes_state_then_publishes_before_next_request(self) -> None:
+        source = (ROOT / "Tweak.xm").read_text(encoding="utf-8")
+        start = re.search(
+            r"(?s)static void PWStartNextRequest\(void\)\s*\{(.*?)\n\}", source
+        )
+        self.assertIsNotNone(start)
+        body = start.group(1)
         self.assertRegex(
             body,
             r"dispatch_after\(dispatch_time\(DISPATCH_TIME_NOW,\s*"
-            r"250 \* NSEC_PER_MSEC\),\s*dispatch_get_main_queue\(\),\s*"
-            r"\^\{ PWPublish\(\); \}\);",
+            r"250 \* NSEC_PER_MSEC\),\s*dispatch_get_main_queue\(\),",
         )
-        self.assertEqual(body.count("PWPublish();"), 1)
-        self.assertNotRegex(body, r"gLastSucceeded\s*=\s*YES;\s*gLastRefused\s*=\s*YES;")
+        completion = body[body.index("dispatch_after") :]
+        for state_probe in ("PWReadDisplayOn()", "PWReadLocked()"):
+            self.assertIn(state_probe, completion)
+        self.assertRegex(
+            completion,
+            r"BOOL succeeded = !refused\s*&&\s*PWObservedRequestSucceeded\(\s*"
+            r"request, actionStarted, displayOn, locked\);",
+        )
+        sequence = [
+            completion.index("gLastSucceeded = succeeded;"),
+            completion.index("gLastRefused = refused && !succeeded;"),
+            completion.index("PWPublish();"),
+            completion.index("gRequestActive = NO;"),
+            completion.index("PWStartNextRequest();"),
+        ]
+        self.assertEqual(sequence, sorted(sequence))
+
+    def test_observed_result_helper_requires_settled_target_state(self) -> None:
+        source = (ROOT / "Tweak.xm").read_text(encoding="utf-8")
+        helper = re.search(
+            r"(?s)static BOOL PWObservedRequestSucceeded\("
+            r"PWRequestKind request, BOOL actionStarted, BOOL displayOn, BOOL locked\)"
+            r"\s*\{(.*?)\n\}",
+            source,
+        )
+        self.assertIsNotNone(helper)
+        body = helper.group(1)
+        self.assertIn("if (!actionStarted) return NO;", body)
+        self.assertRegex(body, r"case PWRequestKindStatus:\s*return YES;")
+        self.assertRegex(body, r"case PWRequestKindWake:\s*return displayOn;")
+        self.assertRegex(
+            body, r"case PWRequestKindUnlock:\s*return displayOn && !locked;"
+        )
+
+    def test_refused_unlock_then_status_publishes_in_order(self) -> None:
+        model = RequestLifecycleModel(capacity=8)
+        self.assertTrue(
+            model.accept("unlock", action_started=False, refused=True)
+        )
+        self.assertTrue(model.accept("status"))
+        self.assertEqual(model.publications, [])
+
+        model.settle(display_on=False, locked=True)
+        self.assertEqual(model.publications, [(False, True)])
+
+        model.settle(display_on=False, locked=True)
+        self.assertEqual(model.publications, [(False, True), (True, False)])
+
+    def test_selector_no_op_and_still_locked_requests_fail(self) -> None:
+        wake = RequestLifecycleModel(capacity=8)
+        self.assertTrue(wake.accept("wake", action_started=True))
+        wake.settle(display_on=False)
+        self.assertEqual(wake.publications, [(False, False)])
+
+        unlock = RequestLifecycleModel(capacity=8)
+        self.assertTrue(unlock.accept("unlock", action_started=True))
+        unlock.settle(display_on=True, locked=True)
+        self.assertEqual(unlock.publications, [(False, False)])
+
+    def test_request_queue_cap_drops_excess_without_growing(self) -> None:
+        model = RequestLifecycleModel(capacity=3)
+        self.assertTrue(model.accept("status"))
+        self.assertTrue(model.accept("wake"))
+        self.assertTrue(model.accept("unlock"))
+        self.assertFalse(model.accept("status"))
+        self.assertEqual(len(model.pending), 2)
+
+        model.settle()
+        model.settle(display_on=True)
+        model.settle(display_on=True, locked=False)
+        self.assertEqual(len(model.publications), 3)
 
     def test_requests_use_exact_fixed_darwin_callbacks_and_names(self) -> None:
         source = (ROOT / "Tweak.xm").read_text(encoding="utf-8")
@@ -455,6 +583,9 @@ class PhoneWakePackageTests(unittest.TestCase):
             "gGeneration = 0;",
             "gLastSucceeded = NO;",
             "gLastRefused = NO;",
+            "gPendingHead = 0;",
+            "gPendingCount = 0;",
+            "gRequestActive = NO;",
         ):
             self.assertIn(reset, body)
         dtor = source[source.index("%dtor") :]

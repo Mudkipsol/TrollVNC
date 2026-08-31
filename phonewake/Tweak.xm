@@ -13,6 +13,13 @@ typedef NS_ENUM(NSInteger, PWPasscodeState) {
     PWPasscodeStateUnknown = 2,
 };
 
+typedef NS_ENUM(uint8_t, PWRequestKind) {
+    PWRequestKindStatus = 0,
+    PWRequestKindWake = 1,
+    PWRequestKindUnlock = 2,
+    PWRequestKindInvalid = UINT8_MAX,
+};
+
 static int gStateToken = -1;
 static uint32_t gGeneration = 0;
 static BOOL gLastSucceeded = NO;
@@ -21,6 +28,11 @@ static CFStringRef gStatusRequest = NULL;
 static CFStringRef gWakeRequest = NULL;
 static CFStringRef gUnlockRequest = NULL;
 static uint8_t gObserverMarker = 0;
+static const uint8_t PWMaxOutstandingRequests = 8;
+static PWRequestKind gPendingRequests[PWMaxOutstandingRequests];
+static uint8_t gPendingHead = 0;
+static uint8_t gPendingCount = 0;
+static BOOL gRequestActive = NO;
 
 static id PWSharedInstance(Class cls) {
     SEL selector = NSSelectorFromString(@"sharedInstance");
@@ -139,25 +151,93 @@ static BOOL PWUnlockWithoutPasscode(BOOL *refused) {
     return NO;
 }
 
-static void PWHandle(NSString *request) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        gLastSucceeded = NO;
-        gLastRefused = NO;
-        if ([request isEqualToString:[NSString stringWithUTF8String:PWRequestStatus]]) {
-            gLastSucceeded = YES;
-        } else if ([request isEqualToString:[NSString stringWithUTF8String:PWRequestWake]]) {
-            gLastSucceeded = PWWakeDisplay();
-        } else if ([request isEqualToString:[NSString stringWithUTF8String:PWRequestUnlock]]) {
-            BOOL refused = NO;
-            gLastSucceeded = PWUnlockWithoutPasscode(&refused);
-            if (refused) {
-                gLastSucceeded = NO;
-                gLastRefused = YES;
-            }
+static BOOL PWObservedRequestSucceeded(PWRequestKind request, BOOL actionStarted, BOOL displayOn, BOOL locked) {
+    if (!actionStarted) return NO;
+    switch (request) {
+        case PWRequestKindStatus:
+            return YES;
+        case PWRequestKindWake:
+            return displayOn;
+        case PWRequestKindUnlock:
+            return displayOn && !locked;
+        default:
+            return NO;
+    }
+}
+
+static BOOL PWEnqueueRequest(PWRequestKind request) {
+    uint8_t outstanding = gPendingCount + (gRequestActive ? 1u : 0u);
+    if (outstanding >= PWMaxOutstandingRequests) return NO;
+    uint8_t tail = (gPendingHead + gPendingCount) % PWMaxOutstandingRequests;
+    gPendingRequests[tail] = request;
+    gPendingCount += 1u;
+    return YES;
+}
+
+static BOOL PWDequeueRequest(PWRequestKind *request) {
+    if (gPendingCount == 0) return NO;
+    *request = gPendingRequests[gPendingHead];
+    gPendingHead = (gPendingHead + 1u) % PWMaxOutstandingRequests;
+    gPendingCount -= 1u;
+    return YES;
+}
+
+static void PWStartNextRequest(void) {
+    if (gRequestActive) return;
+    PWRequestKind request = PWRequestKindInvalid;
+    if (!PWDequeueRequest(&request)) return;
+    gRequestActive = YES;
+
+    BOOL refused = NO;
+    BOOL actionStarted = request == PWRequestKindStatus;
+    if (request == PWRequestKindWake) {
+        actionStarted = PWWakeDisplay();
+    } else if (request == PWRequestKindUnlock) {
+        actionStarted = PWUnlockWithoutPasscode(&refused);
+    }
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        BOOL displayOn = NO;
+        BOOL locked = YES;
+        if (!refused && request != PWRequestKindStatus) {
+            displayOn = PWReadDisplayOn();
+            if (request == PWRequestKindUnlock) locked = PWReadLocked();
         }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
-                       dispatch_get_main_queue(), ^{ PWPublish(); });
+        BOOL succeeded = !refused
+            && PWObservedRequestSucceeded(request, actionStarted, displayOn, locked);
+        gLastSucceeded = succeeded;
+        gLastRefused = refused && !succeeded;
+        PWPublish();
+        gRequestActive = NO;
+        PWStartNextRequest();
     });
+}
+
+static PWRequestKind PWRequestKindForName(NSString *request) {
+    if ([request isEqualToString:[NSString stringWithUTF8String:PWRequestStatus]]) {
+        return PWRequestKindStatus;
+    }
+    if ([request isEqualToString:[NSString stringWithUTF8String:PWRequestWake]]) {
+        return PWRequestKindWake;
+    }
+    if ([request isEqualToString:[NSString stringWithUTF8String:PWRequestUnlock]]) {
+        return PWRequestKindUnlock;
+    }
+    return PWRequestKindInvalid;
+}
+
+static void PWHandle(NSString *request) {
+    if (![NSThread isMainThread]) {
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            PWHandle(request);
+        });
+        return;
+    }
+    PWRequestKind kind = PWRequestKindForName(request);
+    if (kind == PWRequestKindInvalid) return;
+    if (!PWEnqueueRequest(kind)) return;
+    PWStartNextRequest();
 }
 
 static void PWStatusCallback(CFNotificationCenterRef, void *, CFStringRef,
@@ -199,6 +279,9 @@ static void PWCleanup(void) {
     gGeneration = 0;
     gLastSucceeded = NO;
     gLastRefused = NO;
+    gPendingHead = 0;
+    gPendingCount = 0;
+    gRequestActive = NO;
 }
 
 %ctor {
