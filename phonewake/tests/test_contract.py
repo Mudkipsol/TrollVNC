@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import pathlib
 import re
+import textwrap
 import unittest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+WORKFLOW = ROOT.parent / ".github" / "workflows" / "phonewake.yml"
 
 PW_AVAILABLE = 1 << 0
 PW_COMPATIBLE = 1 << 1
@@ -166,6 +168,147 @@ def cancel_registered_tokens(
         if not cancel_results[token]:
             succeeded = False
     return cancelled, succeeded
+
+
+def workflow_run_blocks(workflow: str) -> list[str]:
+    lines = workflow.splitlines()
+    blocks: list[str] = []
+    for index, line in enumerate(lines):
+        match = re.match(r"^(\s*)run:\s*\|\s*$", line)
+        if match is None:
+            continue
+        run_indent = len(match.group(1))
+        body: list[str] = []
+        for candidate in lines[index + 1 :]:
+            candidate_indent = len(candidate) - len(candidate.lstrip())
+            if candidate.strip() and candidate_indent <= run_indent:
+                break
+            body.append(candidate)
+        blocks.append(textwrap.dedent("\n".join(body)).strip())
+    return blocks
+
+
+class PhoneWakeWorkflowTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.assertTrue(
+            WORKFLOW.is_file(),
+            f"standalone phone wake workflow is missing: {WORKFLOW}",
+        )
+        self.workflow = WORKFLOW.read_text(encoding="utf-8")
+
+    def test_triggers_only_live_and_original_plan_pushes_or_manual_runs(
+        self,
+    ) -> None:
+        self.assertRegex(
+            self.workflow,
+            r"(?m)^on:\s*$",
+        )
+        self.assertRegex(
+            self.workflow,
+            r"(?ms)^on:\s*\n\s+push:\s*\n\s+branches:\s*\n"
+            r"\s+- main\s*\n\s+- codex/phone-wake-helper\s*\n"
+            r"\s+workflow_dispatch:\s*$",
+        )
+        self.assertNotIn("pull_request", self.workflow)
+        self.assertNotRegex(self.workflow, r"(?m)^\s+inputs:\s*$")
+
+    def test_has_read_only_permissions_and_no_trollvnc_secrets(self) -> None:
+        self.assertRegex(
+            self.workflow,
+            r"(?ms)^permissions:\s*\n\s+contents: read\s*$",
+        )
+        self.assertNotRegex(
+            self.workflow,
+            r"(?im)^\s*[a-z-]+:\s*write\s*$",
+        )
+        self.assertNotRegex(self.workflow, r"(?i)TVNC_|secrets\.TVNC")
+
+    def test_pins_actions_and_theos_to_immutable_commits(self) -> None:
+        uses_references = re.findall(
+            r"(?m)^\s+uses: [^@\s]+@([^\s#]+)",
+            self.workflow,
+        )
+        self.assertEqual(len(uses_references), 4)
+        for reference in uses_references:
+            self.assertRegex(reference, r"^[0-9a-f]{40}$")
+        checkout_pins = re.findall(
+            r"(?m)^\s+uses: actions/checkout@([0-9a-f]{40}) # v4$",
+            self.workflow,
+        )
+        self.assertEqual(len(checkout_pins), 2)
+        self.assertRegex(
+            self.workflow,
+            r"(?m)^\s+uses: maxim-lobanov/setup-xcode@[0-9a-f]{40} # v1$",
+        )
+        self.assertRegex(
+            self.workflow,
+            r"(?m)^\s+uses: actions/upload-artifact@[0-9a-f]{40} # v4$",
+        )
+        self.assertRegex(
+            self.workflow,
+            r"(?m)^\s+ref: [0-9a-f]{40} # roothide/theos master$",
+        )
+        self.assertNotRegex(
+            self.workflow,
+            r"(?m)^\s+uses:\s+[^\s]+@(v\d+|main|master)\s*(?:#.*)?$",
+        )
+
+    def test_uses_existing_roothide_theos_and_xcode_pattern(self) -> None:
+        self.assertIn("runs-on: macos-14", self.workflow)
+        self.assertEqual(self.workflow.count("persist-credentials: false"), 2)
+        self.assertRegex(
+            self.workflow,
+            r"(?ms)repository: roothide/theos\s*\n"
+            r"\s+ref: [0-9a-f]{40} # roothide/theos master\s*\n"
+            r"\s+path: theos-roothide\s*\n"
+            r"\s+submodules: recursive",
+        )
+        install_blocks = [
+            block
+            for block in workflow_run_blocks(self.workflow)
+            if "install-sdk" in block
+        ]
+        self.assertEqual(
+            install_blocks,
+            [
+                'export THEOS="$GITHUB_WORKSPACE/theos-roothide"\n'
+                "cd theos-roothide\n"
+                "./bin/install-sdk iPhoneOS16.5"
+            ],
+        )
+        self.assertNotIn("iPhoneOS14.5", self.workflow)
+        self.assertIn('xcode-version: "16.2"', self.workflow)
+
+    def test_runs_contract_tests_and_exact_rootless_build(self) -> None:
+        run_blocks = workflow_run_blocks(self.workflow)
+        self.assertIn(
+            "python3 -B -m unittest discover -s phonewake/tests -v",
+            run_blocks,
+        )
+        build_blocks = [
+            block for block in run_blocks if "gmake -C phonewake" in block
+        ]
+        self.assertEqual(
+            build_blocks,
+            [
+                'export THEOS="$GITHUB_WORKSPACE/theos-roothide"\n'
+                "THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1 "
+                "gmake -C phonewake clean package"
+            ],
+        )
+        self.assertNotIn("${{", "\n".join(run_blocks))
+
+    def test_uploads_only_the_phonewake_rootless_package(self) -> None:
+        self.assertEqual(self.workflow.count("actions/upload-artifact@"), 1)
+        self.assertRegex(
+            self.workflow,
+            r"(?ms)uses: actions/upload-artifact@[0-9a-f]{40} # v4\s*\n"
+            r"\s+with:\s*\n"
+            r"\s+name: phonewake-rootless\s*\n"
+            r"\s+path: phonewake/packages/\*\.deb\s*\n"
+            r"\s+if-no-files-found: error",
+        )
+        self.assertNotIn("artifacts/", self.workflow)
 
 
 class RequestLifecycleModel:

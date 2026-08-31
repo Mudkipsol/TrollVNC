@@ -1,0 +1,63 @@
+name: Build Phone Wake Helper
+
+on:
+  push:
+    branches:
+      - main
+      - codex/phone-wake-helper
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          brew install xcbeautify ldid-procursus p7zip make
+
+      - name: Checkout roothide/theos
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: roothide/theos
+          ref: 88506b2c22e9e07dd4ed055f23c9e398a117a2c7 # roothide/theos master
+          path: theos-roothide
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install iOS SDK
+        run: |
+          export THEOS="$GITHUB_WORKSPACE/theos-roothide"
+          cd theos-roothide
+          ./bin/install-sdk iPhoneOS16.5
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1
+        with:
+          xcode-version: "16.2"
+
+      - name: Run contract tests
+        run: |
+          python3 -B -m unittest discover -s phonewake/tests -v
+
+      - name: Build rootless package
+        run: |
+          export THEOS="$GITHUB_WORKSPACE/theos-roothide"
+          THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1 gmake -C phonewake clean package
+
+      - name: Upload rootless package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: phonewake-rootless
+          path: phonewake/packages/*.deb
+          if-no-files-found: error
