@@ -654,13 +654,13 @@ For advanced tuning (HTTP/TLS, wheel tuning, dirty detection, etc.), commit your
 
 The rootless package was built and verified from the following CI output:
 
-- Workflow: [Build TrollVNC run 33388710891](https://github.com/Mudkipsol/TrollVNC/actions/runs/33388710891)
+- Workflow: [Build Phone Wake Helper run 33388710891](https://github.com/Mudkipsol/TrollVNC/actions/runs/33388710891)
 - Source commit: `0c12030c22846a339e3ae52c41d786b002899ac2`
 - Artifact: `phonewake-rootless`
 - Package: `com.mudkipsol.phonewake_0.1.0_iphoneos-arm64.deb`
 - SHA256: `1a50aed4f08a5d9eab71bb080b8f0136feeda904c657ad114761252b0637cd95`
 - Package ID: `com.mudkipsol.phonewake`
-- Installed version: `0.1.0`
+- Package version: `0.1.0`
 
 ### Install with Sileo
 
@@ -668,7 +668,7 @@ The rootless package was built and verified from the following CI output:
 2. Transfer the local `.deb` to the phone and save it in the Files app.
 3. In Files, open the `.deb`, use Share if needed, and choose Sileo.
 4. In Sileo, review package ID `com.mudkipsol.phonewake` and version `0.1.0`, then choose Get or Install and confirm the queued installation.
-5. If Sileo accepts and completes the installation, respring the phone when prompted. These steps do not claim that device installation or acceptance has already occurred.
+5. If Sileo accepts and completes the installation, respring the phone even if Sileo does not prompt. These steps do not claim that device installation or acceptance has already occurred.
 
 The installed command is `/var/jb/usr/bin/phonewakectl`. Run only these safe checks:
 
