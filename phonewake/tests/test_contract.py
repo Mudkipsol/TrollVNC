@@ -170,22 +170,155 @@ def cancel_registered_tokens(
     return cancelled, succeeded
 
 
-def workflow_run_blocks(workflow: str) -> list[str]:
-    lines = workflow.splitlines()
-    blocks: list[str] = []
-    for index, line in enumerate(lines):
-        match = re.match(r"^(\s*)run:\s*\|\s*$", line)
-        if match is None:
+def yaml_indent(line: str) -> int:
+    leading = line[: len(line) - len(line.lstrip())]
+    if "\t" in leading:
+        raise AssertionError("workflow YAML indentation contains a tab")
+    return len(leading)
+
+
+def workflow_yaml_block(
+    lines: list[str],
+    key: str,
+    indent: int,
+    start: int = 0,
+    end: int | None = None,
+) -> tuple[int, int]:
+    if end is None:
+        end = len(lines)
+    header = f"{' ' * indent}{key}:"
+    starts = [index for index in range(start, end) if lines[index] == header]
+    if len(starts) != 1:
+        raise AssertionError(
+            f"workflow must contain one canonical {key} block"
+        )
+    block_start = starts[0]
+    block_end = end
+    for index in range(block_start + 1, end):
+        line = lines[index]
+        if not line.strip() or line.lstrip().startswith("#"):
             continue
-        run_indent = len(match.group(1))
-        body: list[str] = []
-        for candidate in lines[index + 1 :]:
-            candidate_indent = len(candidate) - len(candidate.lstrip())
-            if candidate.strip() and candidate_indent <= run_indent:
-                break
-            body.append(candidate)
-        blocks.append(textwrap.dedent("\n".join(body)).strip())
-    return blocks
+        if yaml_indent(line) <= indent:
+            block_end = index
+            break
+    return block_start, block_end
+
+
+def workflow_trigger_blocks(workflow: str) -> dict[str, tuple[str, ...]]:
+    lines = workflow.splitlines()
+    start, end = workflow_yaml_block(lines, "on", 0)
+    triggers: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in lines[start + 1 : end]:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = yaml_indent(line)
+        if indent == 2:
+            match = re.fullmatch(r"  ([A-Za-z_][A-Za-z0-9_-]*):", line)
+            if match is None:
+                raise AssertionError("workflow trigger uses unsupported YAML syntax")
+            current = match.group(1)
+            if current in triggers:
+                raise AssertionError("workflow contains a duplicate trigger")
+            triggers[current] = []
+            continue
+        if indent < 4 or current is None:
+            raise AssertionError("invalid workflow trigger indentation")
+        triggers[current].append(line[4:])
+    return {
+        trigger: tuple(body)
+        for trigger, body in triggers.items()
+    }
+
+
+def workflow_run_scalars(workflow: str) -> list[str]:
+    lines = workflow.splitlines()
+    start, end = workflow_yaml_block(lines, "jobs", 0)
+    runs: list[str] = []
+    index = start + 1
+    block_header = re.compile(r"[|>](?:[+-]?[1-9]?|[1-9]?[+-]?)")
+    while index < end:
+        line = lines[index]
+        if not line.strip() or line.lstrip().startswith("#"):
+            index += 1
+            continue
+        yaml_indent(line)
+        match = re.match(
+            r"^(?P<indent> *)(?P<dash>-\s+)?"
+            r"(?P<key>run|'run'|\"run\"):\s*(?P<value>.*)$",
+            line,
+        )
+        if match is not None:
+            scalar = match.group("value").strip()
+            if block_header.fullmatch(scalar):
+                run_indent = match.start("key")
+                body: list[str] = []
+                index += 1
+                while index < end:
+                    candidate = lines[index]
+                    if candidate.strip() and yaml_indent(candidate) <= run_indent:
+                        break
+                    body.append(candidate)
+                    index += 1
+                runs.append(textwrap.dedent("\n".join(body)).strip())
+                continue
+            if scalar.startswith(("*", "&")):
+                raise AssertionError("run scalar cannot use a YAML alias or anchor")
+            runs.append(scalar)
+            index += 1
+            continue
+
+        structural = line.lstrip()
+        if re.search(
+            r"(?:^|[\[{,]\s*)(?:run|'run'|\"run\")\s*:",
+            structural,
+        ):
+            raise AssertionError("run key uses unsupported YAML syntax")
+        if re.fullmatch(
+            r"(?:-\s+)?[A-Za-z_][A-Za-z0-9_-]*:\s*.*",
+            structural,
+        ):
+            index += 1
+            continue
+        if re.fullmatch(r"-\s+[A-Za-z0-9_./-]+", structural):
+            index += 1
+            continue
+        raise AssertionError("jobs block uses unsupported YAML syntax")
+    return runs
+
+
+class PhoneWakeWorkflowParserRegressionTests(unittest.TestCase):
+    def test_trigger_parser_exposes_unexpected_top_level_trigger(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8").replace(
+            "  workflow_dispatch:\n",
+            "  workflow_dispatch:\n  issue_comment:\n",
+        )
+        self.assertEqual(
+            tuple(workflow_trigger_blocks(workflow)),
+            ("push", "workflow_dispatch", "issue_comment"),
+        )
+
+    def test_run_parser_includes_inline_expression_bearing_scalar(self) -> None:
+        workflow = """jobs:
+  build:
+    steps:
+      - run: echo "${{ github.event.issue.body }}"
+"""
+        self.assertEqual(
+            workflow_run_scalars(workflow),
+            ['echo "${{ github.event.issue.body }}"'],
+        )
+
+    def test_run_parser_includes_scalar_with_quoted_mapping_key(self) -> None:
+        workflow = """jobs:
+  build:
+    steps:
+      - "run": echo "${{ github.event.issue.body }}"
+"""
+        self.assertEqual(
+            workflow_run_scalars(workflow),
+            ['echo "${{ github.event.issue.body }}"'],
+        )
 
 
 class PhoneWakeWorkflowTests(unittest.TestCase):
@@ -199,18 +332,17 @@ class PhoneWakeWorkflowTests(unittest.TestCase):
     def test_triggers_only_live_and_original_plan_pushes_or_manual_runs(
         self,
     ) -> None:
-        self.assertRegex(
-            self.workflow,
-            r"(?m)^on:\s*$",
+        self.assertEqual(
+            workflow_trigger_blocks(self.workflow),
+            {
+                "push": (
+                    "branches:",
+                    "  - main",
+                    "  - codex/phone-wake-helper",
+                ),
+                "workflow_dispatch": (),
+            },
         )
-        self.assertRegex(
-            self.workflow,
-            r"(?ms)^on:\s*\n\s+push:\s*\n\s+branches:\s*\n"
-            r"\s+- main\s*\n\s+- codex/phone-wake-helper\s*\n"
-            r"\s+workflow_dispatch:\s*$",
-        )
-        self.assertNotIn("pull_request", self.workflow)
-        self.assertNotRegex(self.workflow, r"(?m)^\s+inputs:\s*$")
 
     def test_has_read_only_permissions_and_no_trollvnc_secrets(self) -> None:
         self.assertRegex(
@@ -265,7 +397,7 @@ class PhoneWakeWorkflowTests(unittest.TestCase):
         )
         install_blocks = [
             block
-            for block in workflow_run_blocks(self.workflow)
+            for block in workflow_run_scalars(self.workflow)
             if "install-sdk" in block
         ]
         self.assertEqual(
@@ -280,7 +412,7 @@ class PhoneWakeWorkflowTests(unittest.TestCase):
         self.assertIn('xcode-version: "16.2"', self.workflow)
 
     def test_runs_contract_tests_and_exact_rootless_build(self) -> None:
-        run_blocks = workflow_run_blocks(self.workflow)
+        run_blocks = workflow_run_scalars(self.workflow)
         self.assertIn(
             "python3 -B -m unittest discover -s phonewake/tests -v",
             run_blocks,
