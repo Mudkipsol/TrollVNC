@@ -648,6 +648,62 @@ For advanced tuning (HTTP/TLS, wheel tuning, dirty detection, etc.), commit your
 - Download them from the run page → `Artifacts`.
 - If you push to the `release` branch (and the workflow runs there), a GitHub Release is created automatically with packaged files attached.
 
+## Phone Wake Helper
+
+`phonewake` is a separate rootless helper for the dedicated jailbroken phone. It does not change TrollVNC ports, preferences, authentication, or VNC behavior.
+
+The rootless package was built and verified from the following CI output:
+
+- Workflow: [Build TrollVNC run 33388710891](https://github.com/Mudkipsol/TrollVNC/actions/runs/33388710891)
+- Source commit: `0c12030c22846a339e3ae52c41d786b002899ac2`
+- Artifact: `phonewake-rootless`
+- Package: `com.mudkipsol.phonewake_0.1.0_iphoneos-arm64.deb`
+- SHA256: `1a50aed4f08a5d9eab71bb080b8f0136feeda904c657ad114761252b0637cd95`
+- Package ID: `com.mudkipsol.phonewake`
+- Installed version: `0.1.0`
+
+### Install with Sileo
+
+1. Download the `phonewake-rootless` artifact from the verified workflow run and extract `com.mudkipsol.phonewake_0.1.0_iphoneos-arm64.deb`.
+2. Transfer the local `.deb` to the phone and save it in the Files app.
+3. In Files, open the `.deb`, use Share if needed, and choose Sileo.
+4. In Sileo, review package ID `com.mudkipsol.phonewake` and version `0.1.0`, then choose Get or Install and confirm the queued installation.
+5. If Sileo accepts and completes the installation, respring the phone when prompted. These steps do not claim that device installation or acceptance has already occurred.
+
+The installed command is `/var/jb/usr/bin/phonewakectl`. Run only these safe checks:
+
+```sh
+/var/jb/usr/bin/phonewakectl status
+/var/jb/usr/bin/phonewakectl wake
+/var/jb/usr/bin/phonewakectl unlock
+```
+
+Each successful call prints one JSON object. `unlock` fails closed and dismisses the lock screen only when iOS explicitly reports that no device passcode is set. It never enters or evaluates a passcode.
+
+The command accepts only `status`, `wake`, or `unlock`. It accepts no passcode, arbitrary selector, path, bundle identifier, host, or port.
+
+### Remove with Sileo
+
+1. Open Sileo, find `com.mudkipsol.phonewake` in installed packages, choose Remove, and confirm the queued removal.
+2. Respring the phone after removal completes.
+3. Verify that the command no longer exists:
+
+```sh
+test ! -e /var/jb/usr/bin/phonewakectl && echo "phonewakectl removed"
+```
+
+### Device acceptance record
+
+Do not record SSH keys, tokens, passwords, passcodes, notification content, or other secrets.
+
+- iOS version:
+- Dopamine version:
+- Installed package version:
+- `status` JSON result:
+- Display-off `wake` result:
+- `unlock` result with passcode disabled:
+- `unlock` refusal result with passcode enabled, or `not run` with reason:
+
 ## Build Dependencies
 
 See: <https://github.com/Lessica/BuildVNCServer>
